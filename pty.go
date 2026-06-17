@@ -97,6 +97,9 @@ func teardown(_ context.Context) error {
 	mu.Lock()
 	defer mu.Unlock()
 	for id, s := range sessions {
+		if s != nil && s.cmd != nil {
+			killPtyTree(s.cmd.Process)
+		}
 		_ = s.pty.Close()
 		delete(sessions, id)
 	}
@@ -112,6 +115,9 @@ func teardownCell(_ context.Context, cellID string) error {
 	defer mu.Unlock()
 	for id, s := range sessions {
 		if s != nil && s.cellID == cellID {
+			if s.cmd != nil {
+				killPtyTree(s.cmd.Process)
+			}
 			_ = s.pty.Close()
 			delete(sessions, id)
 		}
@@ -261,6 +267,7 @@ func ptyOpen(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, r
 		logger.Error("pty start", "shell", req.Shell, "err", err)
 		return codeSpawnFailed
 	}
+	superviseProcess(cmd.Process) // enroll the shell so its whole tree dies with us (no orphans)
 
 	mu.Lock()
 	nextID++
@@ -339,6 +346,9 @@ func ptyClose(id uint32) uint32 {
 	mu.Unlock()
 	if s == nil {
 		return codeNoSession
+	}
+	if s.cmd != nil {
+		killPtyTree(s.cmd.Process) // kill the shell + its children, not just close the device
 	}
 	_ = s.pty.Close()
 	return codeOK
