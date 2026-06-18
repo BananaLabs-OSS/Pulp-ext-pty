@@ -5,10 +5,20 @@ package ptyext
 import (
 	"os"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// ptyChildAttr makes the PTY shell create NO console window. The host is GUI-subsystem, so
+// without this each terminal/agent pane's shell (and the agent's node children) FLASHES its
+// own cmd window — "a lot of command prompt windows" on launch when the layout restores
+// several terminal/agent panes. HideWindow + CREATE_NO_WINDOW; go-pty ORs CreationFlags into
+// its ConPTY startup flags, and the pseudoconsole is still the shell's console.
+func ptyChildAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+}
 
 // PTY shells (cmd / powershell / pwsh) spawn their OWN children — a `git push`, an
 // `ssh`, an agent. Closing the ConPTY device does NOT kill them, so without this they

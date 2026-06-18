@@ -262,6 +262,7 @@ func ptyOpen(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, r
 	if req.Dir != "" {
 		cmd.Dir = req.Dir
 	}
+	cmd.SysProcAttr = ptyChildAttr() // no console window for the shell (GUI-subsystem host)
 	if err := cmd.Start(); err != nil {
 		_ = p.Close()
 		logger.Error("pty start", "shell", req.Shell, "err", err)
