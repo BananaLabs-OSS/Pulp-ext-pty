@@ -53,10 +53,11 @@ const (
 )
 
 type session struct {
-	id     uint32
-	cellID string
-	pty    pty.Pty
-	cmd    *pty.Cmd
+	id         uint32
+	cellID     string
+	pty        pty.Pty
+	cmd        *pty.Cmd
+	persistent bool // Part A: survive a cell ↻ reload (teardownCell keeps it; the new cell reattaches by id)
 
 	mu     sync.Mutex
 	out    []byte // buffered output awaiting Poll
@@ -115,6 +116,9 @@ func teardownCell(_ context.Context, cellID string) error {
 	defer mu.Unlock()
 	for id, s := range sessions {
 		if s != nil && s.cellID == cellID {
+			if s.persistent {
+				continue // Part A: agent/named panes outlive a cell reload; the new cell reattaches by pty id
+			}
 			if s.cmd != nil {
 				killPtyTree(s.cmd.Process)
 			}
@@ -224,6 +228,9 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, id uint32) uint32 {
 		return ptyClose(id)
 	}).Export("pty_close")
+	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, id uint32) uint32 {
+		return ptyAlive(id)
+	}).Export("pty_alive")
 	return nil
 }
 
@@ -232,6 +239,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, _ uint32) uint32 { return codeCapAbsent }).Export("pty_write")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, _ uint32) uint32 { return codeCapAbsent }).Export("pty_resize")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _ uint32) uint32 { return codeCapAbsent }).Export("pty_close")
+	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _ uint32) uint32 { return 0 }).Export("pty_alive")
 	return nil
 }
 
@@ -239,9 +247,10 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 
 func ptyOpen(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	var req struct {
-		Shell string   `msgpack:"shell"`
-		Args  []string `msgpack:"args"`
-		Dir   string   `msgpack:"dir"`
+		Shell   string   `msgpack:"shell"`
+		Args    []string `msgpack:"args"`
+		Dir     string   `msgpack:"dir"`
+		Persist bool     `msgpack:"persist"`
 	}
 	if reqLen > 0 {
 		data, ok := m.Memory().Read(reqPtr, reqLen)
@@ -273,7 +282,7 @@ func ptyOpen(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, r
 	mu.Lock()
 	nextID++
 	id := nextID
-	s := &session{id: id, cellID: cellID, pty: p, cmd: cmd}
+	s := &session{id: id, cellID: cellID, pty: p, cmd: cmd, persistent: req.Persist}
 	sessions[id] = s
 	order = append(order, id)
 	mu.Unlock()
@@ -359,6 +368,25 @@ func getSession(id uint32) *session {
 	mu.Lock()
 	defer mu.Unlock()
 	return sessions[id]
+}
+
+// ptyAlive reports 1 if the session exists and its process hasn't exited, else 0.
+// The cell uses it to tell a reattach (a persistent pane that survived a cell ↻
+// reload) from a respawn (host restart / the shell exited).
+func ptyAlive(id uint32) uint32 {
+	mu.Lock()
+	s, ok := sessions[id]
+	mu.Unlock()
+	if !ok || s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return 0
+	}
+	return 1
 }
 
 // pollOutput drains one session's buffered output per call (round-robin) and
