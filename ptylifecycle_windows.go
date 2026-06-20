@@ -11,13 +11,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// ptyChildAttr makes the PTY shell create NO console window. The host is GUI-subsystem, so
-// without this each terminal/agent pane's shell (and the agent's node children) FLASHES its
-// own cmd window — "a lot of command prompt windows" on launch when the layout restores
-// several terminal/agent panes. HideWindow + CREATE_NO_WINDOW; go-pty ORs CreationFlags into
-// its ConPTY startup flags, and the pseudoconsole is still the shell's console.
+// ptyChildAttr returns the SysProcAttr for the PTY shell. It MUST NOT set
+// CREATE_NO_WINDOW: go-pty starts the shell attached to a ConPTY pseudoconsole
+// (conhost runs --headless, so there is no window to suppress), and ORing
+// CREATE_NO_WINDOW into the ConPTY CreateProcess flags detaches the child from
+// the pseudoconsole — the shell's stdout then never reaches the ConPTY read
+// side, so readLoop gets zero bytes and the terminal/agent pane stays blank.
+// (go-pty ignores HideWindow; only CreationFlags is honored — so an empty attr
+// is correct, and the pseudoconsole already guarantees no console window.)
 func ptyChildAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	return &syscall.SysProcAttr{}
 }
 
 // PTY shells (cmd / powershell / pwsh) spawn their OWN children — a `git push`, an
