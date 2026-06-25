@@ -172,7 +172,11 @@ func commandLineForShell(shell string) []string {
 		if p, err := exec.LookPath("bash"); err == nil {
 			return []string{p}
 		}
-	case "sh", "":
+	case "sh":
+		if p, err := exec.LookPath("sh"); err == nil {
+			return []string{p}
+		}
+	case "":
 		if sh := os.Getenv("SHELL"); sh != "" {
 			return []string{sh}
 		}
