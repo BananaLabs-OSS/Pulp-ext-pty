@@ -39,17 +39,17 @@ import (
 )
 
 const (
-	codeOK            = 0
-	codeBadReq        = 1
-	codeMemRead       = 2
-	codeDecode        = 3
-	codeSpawnFailed   = 4
-	codeNoSession     = 6
-	codeAllocFailed   = 7
-	codeMemWrite      = 8
-	codeCapAbsent     = 99
-	maxBufferPerPTY   = 1 << 20 // 1 MiB of un-drained output per PTY, then oldest dropped
-	readChunk         = 4096
+	codeOK          = 0
+	codeBadReq      = 1
+	codeMemRead     = 2
+	codeDecode      = 3
+	codeSpawnFailed = 4
+	codeNoSession   = 6
+	codeAllocFailed = 7
+	codeMemWrite    = 8
+	codeCapAbsent   = 99
+	maxBufferPerPTY = 1 << 20 // 1 MiB of un-drained output per PTY, then oldest dropped
+	readChunk       = 4096
 )
 
 type session struct {
@@ -71,6 +71,7 @@ var (
 	nextID   uint32
 	nextEvID uint64
 	logger   = slog.Default()
+	grants   ext.PlacementGrantResolver
 )
 
 func init() {
@@ -90,6 +91,7 @@ func setup(env ext.SetupEnv) error {
 	if env.Logger != nil {
 		logger = env.Logger
 	}
+	grants = env.PlacementGrants
 	logger.Info("spawn.pty ready", "os", runtime.GOOS)
 	return nil
 }
@@ -217,23 +219,35 @@ func agentCommandLine() []string {
 
 func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	cellID := ""
+	var policy *scopedPTYPolicy
 	if cell != nil {
 		cellID = cell.Name()
+		if grants != nil {
+			scope, err := ext.ValidatedScopeOf(cell)
+			if err != nil {
+				return err
+			}
+			policy, err = resolveScopedPTYPolicy(grants, scope)
+			if err != nil {
+				return err
+			}
+			cellID = scope.RoutingID()
+		}
 	}
 	b.NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-		return ptyOpen(ctx, m, cellID, reqPtr, reqLen, respPtrOut, respLenOut)
+		return ptyOpen(ctx, m, cellID, policy, reqPtr, reqLen, respPtrOut, respLenOut)
 	}).Export("pty_open")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, id, dataPtr, dataLen uint32) uint32 {
-		return ptyWrite(m, id, dataPtr, dataLen)
+		return ptyWrite(m, cellID, id, dataPtr, dataLen)
 	}).Export("pty_write")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, id, cols, rows uint32) uint32 {
-		return ptyResize(id, cols, rows)
+		return ptyResize(cellID, id, cols, rows)
 	}).Export("pty_resize")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, id uint32) uint32 {
-		return ptyClose(id)
+		return ptyClose(cellID, id)
 	}).Export("pty_close")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, id uint32) uint32 {
-		return ptyAlive(id)
+		return ptyAlive(cellID, id)
 	}).Export("pty_alive")
 	return nil
 }
@@ -249,7 +263,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 
 // ---- handlers --------------------------------------------------------------
 
-func ptyOpen(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func ptyOpen(ctx context.Context, m api.Module, cellID string, policy *scopedPTYPolicy, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	var req struct {
 		Shell   string   `msgpack:"shell"`
 		Args    []string `msgpack:"args"`
@@ -266,14 +280,27 @@ func ptyOpen(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, r
 		}
 	}
 	line := append(commandLineForShell(req.Shell), req.Args...)
+	dir := req.Dir
+	var environment []string
+	if policy != nil {
+		var err error
+		line, dir, environment, err = policy.command(req.Shell, req.Args, req.Dir)
+		if err != nil {
+			logger.Warn("spawn.pty: scoped request denied", "cell", cellID, "err", err)
+			return codeBadReq
+		}
+	}
 	p, err := pty.New()
 	if err != nil {
 		logger.Error("pty new", "err", err)
 		return codeSpawnFailed
 	}
 	cmd := p.Command(line[0], line[1:]...)
-	if req.Dir != "" {
-		cmd.Dir = req.Dir
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	if policy != nil {
+		cmd.Env = environment
 	}
 	cmd.SysProcAttr = ptyChildAttr() // no console window for the shell (GUI-subsystem host)
 	if err := cmd.Start(); err != nil {
@@ -321,8 +348,8 @@ func readLoop(s *session) {
 	}
 }
 
-func ptyWrite(m api.Module, id, dataPtr, dataLen uint32) uint32 {
-	s := getSession(id)
+func ptyWrite(m api.Module, cellID string, id, dataPtr, dataLen uint32) uint32 {
+	s := getSessionForCell(id, cellID)
 	if s == nil {
 		return codeNoSession
 	}
@@ -336,8 +363,8 @@ func ptyWrite(m api.Module, id, dataPtr, dataLen uint32) uint32 {
 	return codeOK
 }
 
-func ptyResize(id, cols, rows uint32) uint32 {
-	s := getSession(id)
+func ptyResize(cellID string, id, cols, rows uint32) uint32 {
+	s := getSessionForCell(id, cellID)
 	if s == nil {
 		return codeNoSession
 	}
@@ -347,9 +374,13 @@ func ptyResize(id, cols, rows uint32) uint32 {
 	return codeOK
 }
 
-func ptyClose(id uint32) uint32 {
+func ptyClose(cellID string, id uint32) uint32 {
 	mu.Lock()
 	s := sessions[id]
+	if s == nil || s.cellID != cellID {
+		mu.Unlock()
+		return codeNoSession
+	}
 	delete(sessions, id)
 	for i, x := range order {
 		if x == id {
@@ -358,9 +389,6 @@ func ptyClose(id uint32) uint32 {
 		}
 	}
 	mu.Unlock()
-	if s == nil {
-		return codeNoSession
-	}
 	if s.cmd != nil {
 		killPtyTree(s.cmd.Process) // kill the shell + its children, not just close the device
 	}
@@ -374,14 +402,24 @@ func getSession(id uint32) *session {
 	return sessions[id]
 }
 
+func getSessionForCell(id uint32, cellID string) *session {
+	mu.Lock()
+	defer mu.Unlock()
+	s := sessions[id]
+	if s == nil || s.cellID != cellID {
+		return nil
+	}
+	return s
+}
+
 // ptyAlive reports 1 if the session exists and its process hasn't exited, else 0.
 // The cell uses it to tell a reattach (a persistent pane that survived a cell ↻
 // reload) from a respawn (host restart / the shell exited).
-func ptyAlive(id uint32) uint32 {
+func ptyAlive(cellID string, id uint32) uint32 {
 	mu.Lock()
 	s, ok := sessions[id]
 	mu.Unlock()
-	if !ok || s == nil {
+	if !ok || s == nil || s.cellID != cellID {
 		return 0
 	}
 	s.mu.Lock()
@@ -446,12 +484,22 @@ func writeResp(ctx context.Context, m api.Module, data []byte, respPtrOut, respL
 	if err != nil || len(res) == 0 {
 		return codeAllocFailed
 	}
-	ptr := uint32(res[0])
+	ptr, ok := wasmUint32(res[0])
+	if !ok || uint64(len(data)) > uint64(^uint32(0)) {
+		return codeMemWrite
+	}
 	if ptr == 0 || !m.Memory().Write(ptr, data) {
 		return codeMemWrite
 	}
-	if !m.Memory().WriteUint32Le(respPtrOut, ptr) || !m.Memory().WriteUint32Le(respLenOut, uint32(len(data))) {
+	if !m.Memory().WriteUint32Le(respPtrOut, ptr) || !m.Memory().WriteUint32Le(respLenOut, uint32(len(data))) { // #nosec G115 -- bounded above.
 		return codeMemWrite
 	}
 	return codeOK
+}
+
+func wasmUint32(value uint64) (uint32, bool) {
+	if value > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(value), true
 }
